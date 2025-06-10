@@ -1,0 +1,114 @@
+name: CI/CD da API Flask para AWS ECS
+
+on:
+  push:
+    branches:
+      - main # O branch que você quer que acione o pipeline
+
+env:
+  AWS_REGION: us-east-1 # ✨ Sua região da AWS. Mantido como us-east-1, caso seja diferente, por favor, atualize.
+  ECR_REPOSITORY: devops-aula-api # ✨ O nome do seu repositório ECR
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production # Exemplo: pode definir um ambiente para segredos ou validações
+
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v3
+
+      - name: Configurar Credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Construir Imagem Docker
+        id: build-image
+        run: |
+          # Use o URI completo do ECR que você anotou
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_TAG="${{ github.sha }}" # Usando o SHA do commit como tag
+          LATEST_TAG="latest"
+
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$LATEST_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$LATEST_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Executar Testes Unitários
+        run: |
+          docker run --rm ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest /bin/bash -c "pip install -r requirements.txt && python test_app.py"
+          # Comando para instalar as dependências do requirements.txt e rodar os testes.
+          # Isso é mais robusto para o ambiente de teste.
+
+      - name: Push da Imagem Docker para ECR
+        run: |
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_TAG="${{ github.sha }}"
+          LATEST_TAG="latest"
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$LATEST_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Atualizar Serviço ECS
+        run: |
+          # O ID da conta AWS é inferido automaticamente pelas credenciais configuradas
+          # mas podemos obter para ter certeza
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          
+          # Nome do cluster e do serviço ECS
+          ECS_CLUSTER_NAME="devops-cluster-aula"
+          ECS_SERVICE_NAME="devops-aula-service"
+          TASK_DEFINITION_FAMILY="devops-aula-task" # Família da sua Task Definition
+          CONTAINER_NAME="devops-aula-container" # Nome do seu container dentro da Task Definition
+
+          # Pega a definição de tarefa mais recente para o seu serviço
+          CURRENT_TASK_DEFINITION_ARN=$(aws ecs describe-services --cluster $ECS_CLUSTER_NAME --services $ECS_SERVICE_NAME --query "services[0].taskDefinition" --output text)
+          
+          # Extrai o JSON completo da task definition atual
+          TASK_DEF_JSON=$(aws ecs describe-task-definition --task-definition $CURRENT_TASK_DEFINITION_ARN)
+          
+          # Extrai os detalhes necessários para a nova revisão da task definition
+          CPU=$(echo $TASK_DEF_JSON | jq -r '.taskDefinition.cpu')
+          MEMORY=$(echo $TASK_DEF_JSON | jq -r '.taskDefinition.memory')
+          EXECUTION_ROLE_ARN=$(echo $TASK_DEF_JSON | jq -r '.taskDefinition.executionRoleArn')
+          # taskRoleArn é opcional, se existir, inclua. Caso contrário, remova a linha.
+          TASK_ROLE_ARN=$(echo $TASK_DEF_JSON | jq -r '.taskDefinition.taskRoleArn // empty')
+          NETWORK_MODE=$(echo $TASK_DEF_JSON | jq -r '.taskDefinition.networkMode')
+          REQUIRES_COMPATIBILITIES=$(echo $TASK_DEF_JSON | jq -r '.taskDefinition.requiresCompatibilities | join(",")')
+
+          # Constrói a string de containerDefinitions com a nova imagem e porta
+          # Usando seu ECR URI diretamente
+          NEW_IMAGE_URI="309254318065.dkr.ecr.us-east-1.amazonaws.com/devops-aula-api:${{ github.sha }}"
+          CONTAINER_DEFINITIONS="[{\"name\": \"${CONTAINER_NAME}\", \"image\": \"${NEW_IMAGE_URI}\", \"portMappings\": [{\"containerPort\": 1313, \"protocol\": \"tcp\"}]}]"
+          
+          # Monta o comando de registro da nova Task Definition
+          REGISTER_TASK_DEF_CMD="aws ecs register-task-definition \
+            --family ${TASK_DEFINITION_FAMILY} \
+            --container-definitions '${CONTAINER_DEFINITIONS}' \
+            --execution-role-arn ${EXECUTION_ROLE_ARN} \
+            --requires-compatibilities ${REQUIRES_COMPATIBILITIES} \
+            --network-mode ${NETWORK_MODE} \
+            --cpu ${CPU} \
+            --memory ${MEMORY}"
+
+          # Adiciona a task role se ela existe na definição atual
+          if [ -n "$TASK_ROLE_ARN" ]; then
+              REGISTER_TASK_DEF_CMD+=" --task-role-arn ${TASK_ROLE_ARN}"
+          fi
+
+          # Executa o comando e captura a nova ARN da Task Definition
+          NEW_TASK_DEF_ARN=$($REGISTER_TASK_DEF_CMD --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "Nova Task Definition ARN: $NEW_TASK_DEF_ARN"
+
+          # Força um novo deploy do serviço ECS com a nova Task Definition
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER_NAME \
+            --service $ECS_SERVICE_NAME \
+            --task-definition $NEW_TASK_DEF_ARN \
+            --force-new-deployment
