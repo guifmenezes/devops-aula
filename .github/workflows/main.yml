@@ -85,7 +85,7 @@ jobs:
           # Constrói a string de containerDefinitions com a nova imagem e porta
           # Usando seu ECR URI diretamente
           NEW_IMAGE_URI="309254318065.dkr.ecr.us-east-1.amazonaws.com/devops-aula-api:${{ github.sha }}"
-          CONTAINER_DEFINITIONS="[{\"name\": \"${CONTAINER_NAME}\", \"image\": \"${NEW_IMAGE_URI}\", \"portMappings\": [{\"containerPort\": 1313, \"protocol\": \"tcp\"}]}]"
+          CONTAINER_DEFINITIONS_ESCAPED="[{\"name\": \"${CONTAINER_NAME}\", \"image\": \"${NEW_IMAGE_URI}\", \"portMappings\": [{\"containerPort\": 1313, \"protocol\": \"tcp\"}]}]"
           
           # Monta o comando de registro da nova Task Definition
           REGISTER_TASK_DEF_CMD="aws ecs register-task-definition \
